@@ -5,6 +5,8 @@
 package io.jenkins.plugins.opentelemetry.backend.elastic;
 
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch._types.FieldValue;
+import co.elastic.clients.elasticsearch._types.SlicedScroll;
 import co.elastic.clients.elasticsearch._types.SortOrder;
 import co.elastic.clients.elasticsearch._types.Time;
 import co.elastic.clients.elasticsearch.core.ClearScrollRequest;
@@ -113,56 +115,70 @@ public class ElasticsearchLogStorageScrollingRetriever implements LogStorageRetr
     @Nonnull
     @Override
     public LogsQueryResult overallLog(@Nonnull String traceId, @Nonnull String spanId, @Nullable LogsQueryContext logsQueryContext) throws IOException {
-        // https://www.elastic.co/guide/en/elasticsearch/reference/7.17/scroll-api.html
+        // https://www.elastic.co/guide/en/elasticsearch/reference/7.17/point-in-time-api.html
 
+        String indexPattern = "logs-apm.app-*";
         Charset charset = StandardCharsets.UTF_8;
         boolean completed;
-        String newScrollId;
         List<Hit<ObjectNode>> hits;
-        ElasticsearchLogsQueryScrollingContext context = (ElasticsearchLogsQueryScrollingContext) logsQueryContext;
-        if (context == null) {
-            SearchRequest searchRequest = new SearchRequest.Builder()
-                .scroll(builder -> builder.time("30s"))
-                .size(PAGE_SIZE)
-                .sort(sortBuilder -> sortBuilder.field(fieldBuilder -> fieldBuilder.field(TIMESTAMP).order(SortOrder.Asc)))
-                .query(queryBuilder ->
-                    queryBuilder.match(
-                        matchQueryBuilder -> matchQueryBuilder.field("trace.id").query(
-                            fieldValueBuilder -> fieldValueBuilder.stringValue(traceId))))
-                // .fields() TODO narrow down the list fields to retrieve - we probably have to look at a source filter
-                .build();
-            logger.log(Level.INFO, "Retrieve logs for traceId: " + traceId);
-            SearchResponse<ObjectNode> searchResponse = this.elasticsearchClient.search(searchRequest, ObjectNode.class);
-            hits = searchResponse.hits().hits();
-            newScrollId = searchResponse.scrollId();
-        } else if (context.scrollId == null) {
-            // FIXME WHY wasn't the fetching stopped?
-            logger.log(Level.INFO, "return empty logs");
-            return new LogsQueryResult(new ByteBuffer(), charset, true, new ElasticsearchLogsQueryScrollingContext(null));
+
+        String pitId;
+        int pageNo;
+
+        Time keepAlive = Time.of(t -> t.time("30s"));
+
+        if (logsQueryContext == null) {
+            // Initial request: open a point in time to have consistent pagination results
+            pitId = elasticsearchClient.openPointInTime(pit -> pit
+                .index(indexPattern)
+                .keepAlive(keepAlive)
+            ).id();
+            pageNo = 0;
         } else {
-            logger.log(Level.INFO, "Retrieve logs with scrollId: " + context.scrollId + " for traceId: " + traceId);
-            ScrollRequest scrollRequest = ScrollRequest.of(builder -> builder.scrollId(context.scrollId));
-            ScrollResponse<ObjectNode> scrollResponse = this.elasticsearchClient.scroll(scrollRequest, ObjectNode.class);
-            hits = scrollResponse.hits().hits();
-            newScrollId = context.scrollId; // TODO why doesn't the scroll response hold a new scrollId? scrollResponse.scrollId();
+            // Get PIT id and page number from context
+            ElasticsearchLogsQueryScrollingContext context = (ElasticsearchLogsQueryScrollingContext) logsQueryContext;
+            pitId = context.pitId;
+            pageNo = context.pageNo;
         }
+
+        SearchRequest searchRequest = new SearchRequest.Builder()
+            .pit(pit -> pit
+                .id(pitId)
+                .keepAlive(keepAlive)
+            )
+            .from(pageNo * PAGE_SIZE)
+            .size(PAGE_SIZE)
+            .sort(s -> s.field(f -> f.field(TIMESTAMP).order(SortOrder.Asc)))
+            .query(q -> q
+                .match(m -> m
+                    .field("trace.id")
+                    .query(FieldValue.of(traceId))
+                )
+            )
+            // .fields() TODO narrow down the list fields to retrieve - we probably have to look at a source filter
+            .build();
+
+        logger.log(Level.INFO, "Retrieve logs for traceId: " + traceId);
+        SearchResponse<ObjectNode> searchResponse = this.elasticsearchClient.search(searchRequest, ObjectNode.class);
+        hits = searchResponse.hits().hits();
+
         completed = hits.size() != PAGE_SIZE; // TODO is there smarter?
 
         if (completed) {
-            logger.log(Level.INFO, () -> "Clear scrollId: " + newScrollId + " for trace: " + traceId + ", span: " + spanId);
+            logger.log(Level.INFO, () -> "Clear scrollId: " + pitId + " for trace: " + traceId + ", span: " + spanId);
 
-            ClearScrollRequest clearScrollRequest = ClearScrollRequest.of(builder -> builder.scrollId(newScrollId));
-            elasticsearchClient.clearScroll(clearScrollRequest);
+            elasticsearchClient.closePointInTime(p -> p.id(pitId));
         }
-
 
         ByteBuffer byteBuffer = new ByteBuffer();
         try (Writer w = new OutputStreamWriter(byteBuffer, charset)) {
             writeOutput(w, hits);
         }
 
-        // if completed, then scrollId is closed, don't return it to ensure it's no longer used
-        return new LogsQueryResult(byteBuffer, charset, completed, new ElasticsearchLogsQueryScrollingContext(completed ? null : newScrollId));
+        return new LogsQueryResult(
+            byteBuffer, charset, completed,
+            new ElasticsearchLogsQueryScrollingContext(pitId, pageNo+1)
+        );
     }
 
     /**
